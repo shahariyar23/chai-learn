@@ -206,8 +206,8 @@ NODE_ENV=production pnpm start
 
 # 3. Frontend — build once, then run the Node SSR server on 3001
 cd ../frontend
-pnpm build
-pnpm start
+NODE_ENV=production pnpm build
+NODE_ENV=production pnpm start
 ```
 
 ### Operational notes
