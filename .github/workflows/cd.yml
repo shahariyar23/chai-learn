@@ -1,27 +1,7 @@
+
 name: CD
 
-# Runs only after the CI workflow finishes on `main`, and only deploys
-# if CI actually passed (see the `if:` gate on the job below).
-#
-# Required repo secrets:
-#   EC2_HOST         - server hostname / IP
-#   EC2_USER         - SSH user (needs passwordless sudo for none of this
-#                      anymore — PM2 runs as `yntp`, no systemctl calls)
-#   SSH_PRIVATE_KEY  - private key whose public half is in the user's
-#                      ~/.ssh/authorized_keys on the server
-#
-# Server is expected to be set up by hand first (this is the "deploy
-# without CI/CD" lesson):
-#   - repo cloned at /opt/chai-learn, owned by yntp:devops, tracking `main`
-#   - node (system-wide via NodeSource, /usr/bin/node) and pnpm/pm2
-#     installed globally so any user can reach them
-#   - backend/.env.production  with DATABASE_URL, BETTER_AUTH_SECRET, etc.
-#   - frontend/.env.production with the real VITE_API_URL and PORT
-#   - PM2 processes named `backend` and `frontend`, running as `yntp`,
-#     registered via `pm2 save` + `pm2 startup` (see PM2 bonus chapter)
-#   - EC2_USER has passwordless sudo to run commands as `yntp`
-#     (sudo -u yntp), OR EC2_USER *is* yntp and owns the checkout directly
-
+# Deploy only after CI succeeds on main.
 on:
   workflow_run:
     workflows: ["CI"]
@@ -36,61 +16,139 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
 
-    # THE GATE — only deploy if CI actually passed
+    # Deploy only when CI has passed.
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
-      - name: Deploy over SSH
+      - name: Deploy to AWS EC2
         uses: appleboy/ssh-action@v1.2.5
+
         env:
-          # Deploy the exact commit CI validated, not whatever `main`
-          # happens to be by the time this job runs.
+          # Deploy the exact commit validated by CI.
           DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
+
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           envs: DEPLOY_SHA
+
           script: |
             set -euo pipefail
 
-            # System-wide Node (NodeSource) lives at /usr/bin, and global
-            # npm packages (pnpm, pm2) land under /usr/lib/node_modules
-            # with bins symlinked into /usr/bin too — so a plain PATH
-            # usually finds them. Kept explicit here so a future switch
-            # back to a per-user install doesn't silently break this.
-            export PATH="/usr/bin:$PATH"
-            command -v node >/dev/null || { echo "::error::node not on PATH"; exit 1; }
-            command -v pnpm >/dev/null || { echo "::error::pnpm not on PATH"; exit 1; }
-            command -v pm2  >/dev/null || { echo "::error::pm2 not on PATH"; exit 1; }
+            # ----------------------------------------
+            # 1. Configure Node.js, pnpm and PM2 PATH
+            # ----------------------------------------
+
+            export HOME="/home/mostak"
+
+            export PATH="/home/mostak/.nvm/versions/node/v26.13.0/bin:/home/mostak/.local/share/pnpm/bin:$PATH"
+
+            echo "Checking deployment environment..."
+
+            node -v
+            pnpm -v
+            pm2 -v
+
+            command -v node
+            command -v pnpm
+            command -v pm2
+
+            # ----------------------------------------
+            # 2. Navigate to project directory
+            # ----------------------------------------
 
             cd /opt/chai-learn
+
+            echo "Fetching latest repository information..."
+
             git fetch --quiet origin main
+
+            echo "Deploying commit: $DEPLOY_SHA"
+
             git reset --hard "$DEPLOY_SHA"
 
-            # ---- Build & migrate while the old version keeps serving ----
+            # ----------------------------------------
+            # 3. Backend dependencies and migration
+            # ----------------------------------------
+
+            echo "Installing backend dependencies..."
+
             pnpm --dir backend install --frozen-lockfile
+
+            echo "Running production database migrations..."
+
             NODE_ENV=production pnpm --dir backend run db:migrate:prod
 
+            # ----------------------------------------
+            # 4. Frontend dependencies and build
+            # ----------------------------------------
+
+            echo "Installing frontend dependencies..."
+
             pnpm --dir frontend install --frozen-lockfile
+
+            echo "Building frontend..."
+
             pnpm --dir frontend run build
 
-            # ---- Swap to the new version ----
-            # PM2 processes run under yntp's PM2 daemon, not the SSH user's.
-            # `pm2 reload` does a zero-downtime rolling restart (vs
-            # `systemctl restart`'s brief drop) — this is the concrete
-            # payoff called out in the PM2 bonus chapter.
-            sudo -u yntp -H pm2 reload backend
-            sudo -u yntp -H pm2 reload frontend
+            # ----------------------------------------
+            # 5. Reload PM2 applications
+            # ----------------------------------------
 
-            # ---- Verify (the SSR server needs a few seconds to come up) ----
+            echo "Reloading backend..."
+
+            pm2 reload backend
+
+            echo "Reloading frontend..."
+
+            pm2 reload frontend
+
+            # ----------------------------------------
+            # 6. Backend health check
+            # ----------------------------------------
+
+            echo "Checking backend health..."
+
             for i in $(seq 1 10); do
-              if curl -fsS http://localhost:3000/api/health >/dev/null; then
-                echo "health check passed"
-                exit 0
+              if curl -fsS http://127.0.0.1:3000/api/health >/dev/null; then
+                echo "Backend health check passed."
+                break
               fi
-              echo "waiting for backend to report healthy... ($i/10)"
+
+              echo "Waiting for backend... ($i/10)"
               sleep 3
+
+              if [ "$i" -eq 10 ]; then
+                echo "ERROR: Backend health check failed."
+                pm2 list
+                pm2 logs backend --lines 50 --nostream
+                exit 1
+              fi
             done
-            echo "::error::health check failed after restart"
-            exit 1
+
+            # ----------------------------------------
+            # 7. Frontend health check
+            # ----------------------------------------
+
+            echo "Checking frontend..."
+
+            if ! curl -fsS http://127.0.0.1:3001/ >/dev/null; then
+              echo "ERROR: Frontend health check failed."
+              pm2 list
+              pm2 logs frontend --lines 50 --nostream
+              exit 1
+            fi
+
+            echo "Frontend health check passed."
+
+            # ----------------------------------------
+            # 8. Save PM2 process list
+            # ----------------------------------------
+
+            pm2 save
+
+            echo "======================================"
+            echo "Deployment completed successfully!"
+            echo "Commit: $DEPLOY_SHA"
+            echo "======================================"
